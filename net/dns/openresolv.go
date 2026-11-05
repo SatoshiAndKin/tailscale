@@ -44,14 +44,19 @@ func (m openresolvManager) logCmdErr(cmd *exec.Cmd, err error) {
 }
 
 // openresolvNoSnippetsExitCode is the exit status resolvconf returns when a
-// requested config snippet does not exist. Asking for all snippets when none
-// are registered returns this status too, because openresolv treats the empty
-// result as a missing snippet rather than as an empty list.
+// requested config snippet does not exist. openresolv 3.17 returns it for an
+// empty listing too, because it treats the empty result as a missing snippet
+// rather than as an empty list (tailscale/tailscale#20825). Earlier releases
+// print nothing on stdout or stderr for an empty listing. Before 3.13 they
+// exit 1, and that is what FreeBSD ships (tailscale/tailscale#11907). From
+// 3.13 on they exit 0.
 const openresolvNoSnippetsExitCode = 2
 
 // readSnippets runs resolvconf with the given arguments and returns its stdout.
-// An exit status of openresolvNoSnippetsExitCode is not an error: it returns no
-// output and a nil error. Other failures are logged and returned.
+// An empty listing is not an error: it returns no output and a nil error. That
+// covers an exit status of openresolvNoSnippetsExitCode, and any other exit
+// status with nothing on stdout or stderr. Other failures are logged and
+// returned.
 //
 // Callers must pass either "-i" with no arguments or "-l" with explicit snippet
 // names. Only those forms produce empty stdout alongside
@@ -65,9 +70,12 @@ func (m openresolvManager) readSnippets(args ...string) ([]byte, error) {
 	cmd := exec.Command("resolvconf", args...)
 	out, err := cmd.Output()
 	if err != nil {
-		if ee, ok := errors.AsType[*exec.ExitError](err); ok && ee.ExitCode() == openresolvNoSnippetsExitCode {
-			m.logf("[v1] resolvconf %q found no matching config snippets", args)
-			return nil, nil
+		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+			silent := len(bytes.TrimSpace(out)) == 0 && len(bytes.TrimSpace(ee.Stderr)) == 0
+			if ee.ExitCode() == openresolvNoSnippetsExitCode || silent {
+				m.logf("[v1] resolvconf %q found no matching config snippets (exit status %d)", args, ee.ExitCode())
+				return nil, nil
+			}
 		}
 		m.logCmdErr(cmd, err)
 		return nil, err

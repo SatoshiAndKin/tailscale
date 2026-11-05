@@ -473,7 +473,7 @@ type Node struct {
 	snatSubnetRoutes *bool // nil means default (true)
 	webServerPort    int
 	sshPort          int        // host port for SSH debug access (cloud VMs only)
-	dnsMode          DNSMode    // desired Linux DNS backend to provision; "" means the image default
+	dnsMode          DNSMode    // desired DNS backend to provision; "" means the image default
 	qmpPath          string     // socket path for talking to the QEMU process for the node
 	dhcpClient       DHCPClient // DHCP client for the vnet NIC; "" means the image default
 }
@@ -562,6 +562,12 @@ func (e *Env) AddNode(name string, opts ...any) *Node {
 
 	if n.systemdUnit && (n.os.IsGokrazy || n.os.GOOS() != "linux") {
 		e.t.Fatalf("SystemdUnit is only supported on Linux cloud VMs; node %s is %s", name, n.os.Name)
+	}
+
+	// FreeBSD has a provisioning recipe for DNSOpenresolv only. See
+	// writeFreeBSDDNSModeSetup.
+	if n.os.GOOS() == "freebsd" && n.dnsMode != DNSDefault && n.dnsMode != DNSOpenresolv {
+		e.t.Fatalf("AddNode(%q): DNSMode %q is not supported on FreeBSD", name, n.dnsMode)
 	}
 
 	// macOS VMs require a macOS arm64 host (Apple Virtualization.framework via
@@ -657,16 +663,17 @@ const (
 	// so tailscaled selects the "direct" manager (rewrites resolv.conf itself).
 	DNSDirect DNSMode = "direct"
 
-	// DNSOpenresolv masks systemd-resolved and installs upstream openresolv
-	// (which no cloud image ships), so tailscaled selects the "openresolv"
-	// manager. Its key directory is created empty, so unless [WithDHCPClient]
-	// selects a client whose resolv.conf hook registers a snippet, the only
-	// one ever registered is Tailscale's own. Before the fix for
-	// tailscale/tailscale#20825, tailscaled handled an empty key directory
-	// wrong: openresolv reports "no snippets" by exiting 2, and net/dns
-	// treated that non-zero exit as a hard failure.
+	// DNSOpenresolv provisions the guest so tailscaled selects the
+	// "openresolv" manager, with openresolv's snippet directory present but
+	// empty. Unless [WithDHCPClient] selects a client whose resolv.conf hook
+	// registers a snippet, the only one ever registered is Tailscale's own.
 	//
-	// openresolv's sources are vendored into the tree; see openresolv.go.
+	// On Linux, this masks systemd-resolved and installs upstream openresolv,
+	// which no Linux cloud image ships. Its sources are vendored into the
+	// tree. See openresolv.go.
+	//
+	// On FreeBSD, this uses the openresolv in the base system and
+	// deregisters the snippets dhclient added. See writeFreeBSDDNSModeSetup.
 	DNSOpenresolv DNSMode = "openresolv"
 )
 
@@ -712,9 +719,9 @@ func SNATSubnetRoutes(v bool) nodeOptSNATSubnetRoutes { return nodeOptSNATSubnet
 // The webserver responds with "Hello world I am <nodename> from <sourceIP>" on all requests.
 func WebServer(port int) nodeOptWebServer { return nodeOptWebServer(port) }
 
-// WithDNSMode returns a NodeOption that provisions the (Linux) node so
-// tailscaled selects the given DNS backend. Only meaningful for Linux cloud
-// images; ignored for gokrazy/macOS. See [DNSMode].
+// WithDNSMode returns a NodeOption that provisions the node so tailscaled
+// selects the given DNS backend. Only meaningful for Linux cloud images and
+// FreeBSD; ignored for gokrazy/macOS. See [DNSMode].
 func WithDNSMode(m DNSMode) nodeOptDNSMode { return nodeOptDNSMode(m) }
 
 // WithDHCPClient returns a NodeOption that provisions the node so the given
