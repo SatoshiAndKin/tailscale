@@ -906,11 +906,20 @@ func (e *extension) sendLoop(ctx context.Context) {
 }
 
 func (e *extension) handleAddressAssignment(ctx context.Context, as addrs) error {
+	// The client may have been reset between this assignment being queued and
+	// us getting to it. There's nothing to tell a connector from the profile
+	// we just left about a transit IP we no longer track, and this isn't a
+	// failure worth logging, so drop it quietly.
+	if !e.conn25.client.genIsCurrent(as.gen) {
+		return nil
+	}
 	err := e.sendAddressAssignment(ctx, as)
 	if err != nil {
 		return err
 	}
-	err = e.conn25.client.addTransitIPForConnector(as.connectorAddr.transit, as.connectorAddr.node)
+	// The generation is checked again inside, under the client lock, because
+	// reset can run while the request above is in flight.
+	err = e.conn25.client.addTransitIPForConnector(as.gen, as.connectorAddr.transit, as.connectorAddr.node)
 	if err != nil {
 		return err
 	}
