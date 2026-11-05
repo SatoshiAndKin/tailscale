@@ -405,8 +405,28 @@ func TestResetDropsInFlightAssignment(t *testing.T) {
 	}
 }
 
+// currentGen returns the client's current generation, for tests that build an
+// [addrs] by hand instead of letting [client.enqueueAddressAssignment] stamp
+// one. Reading as.gen off such a literal would only ever see the zero value,
+// which happens to be current until something calls [client.reset].
+func (c *client) currentGen() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gen
+}
+
+// enqueueAddressAssignmentForTest is [client.enqueueAddressAssignment] with the
+// lock it expects callers to hold. The production callers all enqueue from
+// inside a c.mu critical section; tests reach for it on its own.
+func (c *client) enqueueAddressAssignmentForTest(as *addrs) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.enqueueAddressAssignment(as)
+}
+
 func TestTransitIPConnMapping(t *testing.T) {
 	conn25 := newConn25(t.Logf)
+	gen := conn25.client.currentGen()
 
 	as := &addrs{
 		dst:           netip.MustParseAddr("1.2.3.1"),
@@ -432,7 +452,7 @@ func TestTransitIPConnMapping(t *testing.T) {
 	}
 
 	// Adding a transit IP that isn't known should fail
-	if err := conn25.client.addTransitIPForConnector(as.gen, as.connectorAddr.transit, connectorPeers[1]); err == nil {
+	if err := conn25.client.addTransitIPForConnector(gen, as.connectorAddr.transit, connectorPeers[1]); err == nil {
 		t.Error("adding an unknown transit IP should fail")
 	}
 
@@ -440,16 +460,16 @@ func TestTransitIPConnMapping(t *testing.T) {
 	conn25.client.assignments.insert(as)
 
 	// Adding a transit IP for a node with an unset key should fail
-	if err := conn25.client.addTransitIPForConnector(as.gen, as.connectorAddr.transit, connectorPeers[0]); err == nil {
+	if err := conn25.client.addTransitIPForConnector(gen, as.connectorAddr.transit, connectorPeers[0]); err == nil {
 		t.Error("adding an transit IP mapping for a connector with a zero key should fail")
 	}
 	// Adding a transit IP that is known should succeed
-	if err := conn25.client.addTransitIPForConnector(as.gen, as.connectorAddr.transit, connectorPeers[1]); err != nil {
+	if err := conn25.client.addTransitIPForConnector(gen, as.connectorAddr.transit, connectorPeers[1]); err != nil {
 		t.Errorf("unexpected error for first time add: %v", err)
 	}
 	// And doing it again shouldn't fail (this is done when resending mappings
 	// to a restarted connector)
-	if err := conn25.client.addTransitIPForConnector(as.gen, as.connectorAddr.transit, connectorPeers[1]); err != nil {
+	if err := conn25.client.addTransitIPForConnector(gen, as.connectorAddr.transit, connectorPeers[1]); err != nil {
 		t.Errorf("error adding duplicate transitIP for a connector: %v", err)
 	}
 }

@@ -365,7 +365,12 @@ type addrs struct {
 	magic netip.Addr
 	// gen is the [client.gen] this assignment was queued under, set by
 	// [client.enqueueAddressAssignment]. It is only meaningful on the copy
-	// travelling through addrsCh. See the comment on [client.gen].
+	// travelling through addrsCh, and is zero on the one held in
+	// c.assignments: reset clears c.assignments and bumps c.gen together under
+	// c.mu, so an assignment still reachable from there is by construction from
+	// the current generation and has no need of a stamp. It's the copy that has
+	// escaped c.mu that needs to say which generation it came from.
+	// See the comment on [client.gen].
 	gen             uint64
 	connectorAddr   connectorAddr
 	domain          dnsname.FQDN
