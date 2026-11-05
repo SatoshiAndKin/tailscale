@@ -396,7 +396,7 @@ func TestResetDropsInFlightAssignment(t *testing.T) {
 	}
 
 	// The in-flight request now completes against the new state.
-	err = c.addTransitIPForConnector(inFlight.gen, inFlight.connectorAddr.transit, inFlight.connectorAddr.node)
+	err = c.addTransitIPForConnector(inFlight)
 	if !errors.Is(err, errStaleGeneration) {
 		t.Errorf("applying an assignment from before the reset: got error %v, want %v", err, errStaleGeneration)
 	}
@@ -406,9 +406,9 @@ func TestResetDropsInFlightAssignment(t *testing.T) {
 }
 
 // currentGen returns the client's current generation, for tests that build an
-// [addrs] by hand instead of letting [client.enqueueAddressAssignment] stamp
-// one. Reading as.gen off such a literal would only ever see the zero value,
-// which happens to be current until something calls [client.reset].
+// [addrs] by hand instead of letting [client.reserveAddresses] stamp one.
+// Leaving gen off such a literal would only ever give the zero value, which
+// happens to be current until something calls [client.reset].
 func (c *client) currentGen() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -416,24 +416,36 @@ func (c *client) currentGen() uint64 {
 }
 
 // enqueueAddressAssignmentForTest is [client.enqueueAddressAssignment] with the
-// lock it expects callers to hold. The production callers all enqueue from
-// inside a c.mu critical section; tests reach for it on its own.
+// lock it expects callers to hold, plus the generation stamp that
+// [client.reserveAddresses] would have applied. The production callers all
+// enqueue from inside a c.mu critical section; tests reach for it on its own,
+// and build the [addrs] by hand rather than reserving one. Without the stamp
+// such an assignment looks like it predates the last [client.reset] and is
+// silently dropped.
 func (c *client) enqueueAddressAssignmentForTest(as *addrs) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	as.gen = c.gen
 	return c.enqueueAddressAssignment(as)
 }
 
 func TestTransitIPConnMapping(t *testing.T) {
 	conn25 := newConn25(t.Logf)
-	gen := conn25.client.currentGen()
 
 	as := &addrs{
 		dst:           netip.MustParseAddr("1.2.3.1"),
 		magic:         netip.MustParseAddr("100.64.0.1"),
+		gen:           conn25.client.currentGen(),
 		connectorAddr: connectorAddr{transit: netip.MustParseAddr("169.254.0.1")},
 		domain:        "woo.example.com.",
 		app:           "app1",
+	}
+	// forConnector is the assignment as it would reach
+	// [client.addTransitIPForConnector] had it been reserved against n.
+	forConnector := func(n tailcfg.NodeView) addrs {
+		a := *as
+		a.connectorAddr.node = n
+		return a
 	}
 
 	connectorPeers := []tailcfg.NodeView{
@@ -452,7 +464,7 @@ func TestTransitIPConnMapping(t *testing.T) {
 	}
 
 	// Adding a transit IP that isn't known should fail
-	if err := conn25.client.addTransitIPForConnector(gen, as.connectorAddr.transit, connectorPeers[1]); err == nil {
+	if err := conn25.client.addTransitIPForConnector(forConnector(connectorPeers[1])); err == nil {
 		t.Error("adding an unknown transit IP should fail")
 	}
 
@@ -460,16 +472,16 @@ func TestTransitIPConnMapping(t *testing.T) {
 	conn25.client.assignments.insert(as)
 
 	// Adding a transit IP for a node with an unset key should fail
-	if err := conn25.client.addTransitIPForConnector(gen, as.connectorAddr.transit, connectorPeers[0]); err == nil {
+	if err := conn25.client.addTransitIPForConnector(forConnector(connectorPeers[0])); err == nil {
 		t.Error("adding an transit IP mapping for a connector with a zero key should fail")
 	}
 	// Adding a transit IP that is known should succeed
-	if err := conn25.client.addTransitIPForConnector(gen, as.connectorAddr.transit, connectorPeers[1]); err != nil {
+	if err := conn25.client.addTransitIPForConnector(forConnector(connectorPeers[1])); err != nil {
 		t.Errorf("unexpected error for first time add: %v", err)
 	}
 	// And doing it again shouldn't fail (this is done when resending mappings
 	// to a restarted connector)
-	if err := conn25.client.addTransitIPForConnector(gen, as.connectorAddr.transit, connectorPeers[1]); err != nil {
+	if err := conn25.client.addTransitIPForConnector(forConnector(connectorPeers[1])); err != nil {
 		t.Errorf("error adding duplicate transitIP for a connector: %v", err)
 	}
 }

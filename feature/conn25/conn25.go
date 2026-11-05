@@ -547,6 +547,7 @@ func newConn25(logf logger.Logf) *Conn25 {
 		addrsCh:     make(chan addrs, 64),
 		assignments: addrAssignments{clock: tstime.StdClock{}},
 		getIPSets:   getIPSets,
+		gen:         firstGen,
 	}
 	c.connector = &connector{
 		logf:        logf,
@@ -912,7 +913,7 @@ func (e *extension) handleAddressAssignment(ctx context.Context, as addrs) error
 	// us getting to it. There's nothing to tell a connector from the profile
 	// we just left about a transit IP we no longer track, and this isn't a
 	// failure worth logging, so drop it quietly.
-	if !e.conn25.client.genIsCurrent(as.gen) {
+	if !e.conn25.client.assignmentIsCurrent(as) {
 		return nil
 	}
 	err := e.sendAddressAssignment(ctx, as)
@@ -923,7 +924,7 @@ func (e *extension) handleAddressAssignment(ctx context.Context, as addrs) error
 	// reset can run while the request above is in flight. That's the check
 	// that actually closes the window, and losing the race is expected rather
 	// than a failure, so drop it as quietly as the one above.
-	err = e.conn25.client.addTransitIPForConnector(as.gen, as.connectorAddr.transit, as.connectorAddr.node)
+	err = e.conn25.client.addTransitIPForConnector(as)
 	if err != nil {
 		if errors.Is(err, errStaleGeneration) {
 			return nil

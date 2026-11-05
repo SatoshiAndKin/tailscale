@@ -33,7 +33,7 @@ type client struct {
 	// Remember to add new fields to [client.reset] if needed.
 	mu sync.Mutex // protects the fields below
 	// gen counts the resets this client has been through. Every assignment is
-	// stamped with the gen it was queued under, so that assignments which were
+	// stamped with the gen it was created under, so that assignments which were
 	// already in flight when the state was cleared can be recognized and
 	// dropped instead of being applied to the state that replaced it.
 	gen             uint64
@@ -212,6 +212,7 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 	as := &addrs{
 		dst:   dst,
 		magic: mip,
+		gen:   c.gen,
 		connectorAddr: connectorAddr{
 			transit: tip,
 			node:    connectorNode,
@@ -234,43 +235,49 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 	return as, nil
 }
 
+// firstGen is the generation a newly constructed [client] starts at. It is
+// deliberately above the zero value: an [addrs] that was never stamped by
+// [client.reserveAddresses] then can't match the current generation, so a
+// missing stamp is dropped consistently rather than passing until the first
+// [client.reset].
+const firstGen = 1
+
 // errStaleGeneration is returned when an assignment reserved before a
 // [client.reset] is applied after it. The assignment describes state that no
 // longer exists, so it's dropped rather than applied.
 var errStaleGeneration = errors.New("address assignment is from a previous generation")
 
-// genIsCurrent reports whether gen is this client's current generation, i.e.
-// whether an assignment stamped with gen was queued since the last reset.
-func (c *client) genIsCurrent(gen uint64) bool {
+// assignmentIsCurrent reports whether as was created since the last
+// [client.reset], i.e. whether it still describes state this client tracks.
+func (c *client) assignmentIsCurrent(as addrs) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return gen == c.gen
+	return as.gen == c.gen
 }
 
-func (c *client) addTransitIPForConnector(gen uint64, tip netip.Addr, conn tailcfg.NodeView) error {
+func (c *client) addTransitIPForConnector(as addrs) error {
+	conn := as.connectorAddr.node
 	if !conn.Valid() {
 		return fmt.Errorf("unexpectedly received invalid connector node")
 	}
 	if conn.Key().IsZero() {
 		return fmt.Errorf("node with stable ID %q does not have a key", conn.StableID())
 	}
-	return c.insertTransitConnMapping(gen, tip, conn.Key())
+	return c.insertTransitConnMapping(as, conn.Key())
 }
 
 // errQueueFull is returned when the address assignment send queue is full and
 // the assignment was dropped. It's backpressure, not a hard failure.
 var errQueueFull = errors.New("queue full")
 
-// enqueueAddressAssignment queues addrs to be sent to its connector. It stamps
-// the queued copy with the current generation, so that a reset between here and
-// the send can be detected. c.mu must be held.
+// enqueueAddressAssignment queues addrs to be sent to its connector.
+// c.mu must be held: [client.reset] drains the queue under the same lock, and
+// relies on nothing being able to enqueue while it does.
 func (c *client) enqueueAddressAssignment(addrs *addrs) error {
-	queued := *addrs
-	queued.gen = c.gen
 	select {
 	// TODO(fran) investigate the value of waiting for multiple addresses and sending them
 	// in one ConnectorTransitIPRequest
-	case c.addrsCh <- queued:
+	case c.addrsCh <- *addrs:
 		return nil
 	default:
 		c.logf("address assignment queue full, dropping transit assignment for %v", addrs.domain)
@@ -363,14 +370,10 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 type addrs struct {
 	dst   netip.Addr
 	magic netip.Addr
-	// gen is the [client.gen] this assignment was queued under, set by
-	// [client.enqueueAddressAssignment]. It is only meaningful on the copy
-	// travelling through addrsCh, and is zero on the one held in
-	// c.assignments: reset clears c.assignments and bumps c.gen together under
-	// c.mu, so an assignment still reachable from there is by construction from
-	// the current generation and has no need of a stamp. It's the copy that has
-	// escaped c.mu that needs to say which generation it came from.
-	// See the comment on [client.gen].
+	// gen is the [client.gen] this assignment was created under, stamped by
+	// [client.reserveAddresses]. It travels with every copy of the assignment,
+	// so a copy that has escaped c.mu can still say which generation it belongs
+	// to. See the comment on [client.gen].
 	gen             uint64
 	connectorAddr   connectorAddr
 	domain          dnsname.FQDN
@@ -394,9 +397,9 @@ func (as addrs) is6() bool {
 
 // insertTransitConnMapping adds an entry to the byConnKey map
 // for the provided transitIP (as a prefix).
-// The provided transitIP must already be present in the byTransitIP map, and
-// gen must be the current generation.
-func (c *client) insertTransitConnMapping(gen uint64, tip netip.Addr, connKey key.NodePublic) error {
+// The provided assignment must already be present in the byTransitIP map, and
+// must be from the current generation.
+func (c *client) insertTransitConnMapping(as addrs, connKey key.NodePublic) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// Checked under c.mu, which is what makes this exclusive with [client.reset].
@@ -404,9 +407,10 @@ func (c *client) insertTransitConnMapping(gen uint64, tip netip.Addr, connKey ke
 	// pools from scratch, so the same transit IP can be handed back out to a
 	// new assignment, and the lookup below would then succeed for a connector
 	// belonging to the profile we just left.
-	if gen != c.gen {
+	if as.gen != c.gen {
 		return errStaleGeneration
 	}
+	tip := as.connectorAddr.transit
 	if _, ok := c.assignments.lookupByTransitIP(tip); !ok {
 		return errors.New("transit IP is not already known")
 	}

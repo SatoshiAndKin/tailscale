@@ -1521,7 +1521,7 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 				tt.wantByMagicIP,
 				c.client.assignments.byMagicIP,
 				cmp.AllowUnexported(addrs{}, connectorAddr{}),
-				cmpopts.IgnoreFields(addrs{}, "expiresAt"),
+				cmpopts.IgnoreFields(addrs{}, "expiresAt", "gen"),
 				cmpopts.EquateComparable(netip.Addr{}),
 				nodeViewComparer,
 			); diff != "" {
