@@ -678,6 +678,9 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort, 
 func (b *LocalBackend) tcpHandlerForServeTCP(tcph ipn.TCPPortHandlerView, dport uint16, srcAddr netip.AddrPort, httpCtx *serveHTTPContext, forVIPService tailcfg.ServiceName) func(net.Conn) error {
 	if tcph.HTTPS() || tcph.HTTP() {
 		hs := &http.Server{
+			// Keep the recommended minimum stream limit. Clients can spread
+			// larger RPC workloads over multiple HTTP/2 connections.
+			HTTP2:   &http.HTTP2Config{MaxConcurrentStreams: 100},
 			Handler: http.HandlerFunc(b.serveWebHandler),
 			BaseContext: func(_ net.Listener) context.Context {
 				c := *httpCtx
@@ -988,7 +991,7 @@ func (rp *reverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy is closed", http.StatusServiceUnavailable)
 		return
 	}
-	p := &httputil.ReverseProxy{Rewrite: func(r *httputil.ProxyRequest) {
+	p := &httputil.ReverseProxy{BufferPool: &serveProxyBuffers, Rewrite: func(r *httputil.ProxyRequest) {
 		oldOutPath := r.Out.URL.Path
 		r.SetURL(rp.url)
 
