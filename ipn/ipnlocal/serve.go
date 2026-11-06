@@ -988,7 +988,7 @@ func (rp *reverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy is closed", http.StatusServiceUnavailable)
 		return
 	}
-	p := &httputil.ReverseProxy{Rewrite: func(r *httputil.ProxyRequest) {
+	p := &httputil.ReverseProxy{BufferPool: &serveProxyBuffers, Rewrite: func(r *httputil.ProxyRequest) {
 		oldOutPath := r.Out.URL.Path
 		r.SetURL(rp.url)
 

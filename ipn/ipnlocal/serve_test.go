@@ -2336,3 +2336,58 @@ func TestReverseProxyRechecksTailscaledSocketPerDial(t *testing.T) {
 		t.Fatalf("dial after the symlink swap = %v; want ErrProxyToTailscaledSocket", err)
 	}
 }
+
+// Copy bodies across the scratch-buffer boundary concurrently. Each response
+// must retain its own bytes and trailers when buffers return to the shared pool.
+func TestServeProxyConcurrentResponseBuffers(t *testing.T) {
+	b := newTestBackend(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		size, err := strconv.Atoi(r.URL.Query().Get("size"))
+		if err != nil {
+			t.Error(err)
+			http.Error(w, "bad size", 400)
+			return
+		}
+		seed := r.URL.Query().Get("seed")
+		w.Header().Set("Trailer", "X-Buffer-Test")
+		w.Write(bytes.Repeat([]byte(seed), size))
+		w.Header().Set("X-Buffer-Test", seed)
+	}))
+	defer upstream.Close()
+	conf := &ipn.ServeConfig{Web: map[ipn.HostPort]*ipn.WebServerConfig{
+		"example.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: upstream.URL}}},
+	}}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Go(func() {
+			seed := string(rune('a' + i))
+			for _, size := range []int{0, 1, serveProxyBufferSize - 1, serveProxyBufferSize, serveProxyBufferSize + 1, 4*serveProxyBufferSize + 1} {
+				req := httptest.NewRequest("GET", fmt.Sprintf("https://example.ts.net/?size=%d&seed=%s", size, seed), nil)
+				req.TLS = &tls.ConnectionState{ServerName: "example.ts.net"}
+				req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
+					DestPort: 443, SrcAddr: netip.MustParseAddrPort("1.2.3.4:1234"),
+				}))
+				w := httptest.NewRecorder()
+				b.serveWebHandler(w, req)
+				response := w.Result()
+				body, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if response.StatusCode != 200 || !bytes.Equal(body, bytes.Repeat([]byte(seed), size)) {
+					t.Errorf("response %s size %d: status=%d bytes=%d", seed, size, response.StatusCode, len(body))
+					return
+				}
+				if got := response.Trailer.Get("X-Buffer-Test"); got != seed {
+					t.Errorf("trailer=%q want %q", got, seed)
+				}
+			}
+		})
+	}
+	wg.Wait()
+}
