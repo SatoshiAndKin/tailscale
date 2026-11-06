@@ -364,11 +364,9 @@ func (e *extension) Shutdown() error {
 	if e.ctxCancel != nil {
 		e.ctxCancel(errors.New("extension shutdown"))
 	}
-	// addrsCh is deliberately left open. Cancelling the context above is what
-	// stops [extension.sendLoop]; closing the channel would instead race the
-	// DNS path, which can still be reserving addresses and enqueueing onto it
-	// (a send on a closed channel panics), and would leave sendLoop spinning
-	// on zero-value receives until the select happened to pick ctx.Done().
+	if e.conn25 != nil {
+		close(e.conn25.client.addrsCh)
+	}
 	return nil
 }
 
@@ -909,10 +907,6 @@ func (e *extension) sendLoop(ctx context.Context) {
 }
 
 func (e *extension) handleAddressAssignment(ctx context.Context, as addrs) error {
-	// The client may have been reset between this assignment being queued and
-	// us getting to it. There's nothing to tell a connector from the profile
-	// we just left about a transit IP we no longer track, and this isn't a
-	// failure worth logging, so drop it quietly.
 	if !e.conn25.client.assignmentIsCurrent(as) {
 		return nil
 	}
@@ -920,10 +914,6 @@ func (e *extension) handleAddressAssignment(ctx context.Context, as addrs) error
 	if err != nil {
 		return err
 	}
-	// The generation is checked again inside, under the client lock, because
-	// reset can run while the request above is in flight. That's the check
-	// that actually closes the window, and losing the race is expected rather
-	// than a failure, so drop it as quietly as the one above.
 	err = e.conn25.client.addTransitIPForConnector(as)
 	if err != nil {
 		if errors.Is(err, errStaleGeneration) {

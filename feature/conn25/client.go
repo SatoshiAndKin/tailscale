@@ -31,12 +31,8 @@ type client struct {
 	getIPSets func() ipSets
 
 	// Remember to add new fields to [client.reset] if needed.
-	mu sync.Mutex // protects the fields below
-	// gen counts the resets this client has been through. Every assignment is
-	// stamped with the gen it was created under, so that assignments which were
-	// already in flight when the state was cleared can be recognized and
-	// dropped instead of being applied to the state that replaced it.
-	gen             uint64
+	mu              sync.Mutex // protects the fields below
+	gen             uint64     // Current generation ID
 	v4MagicIPPool   *ippool
 	v4TransitIPPool *ippool
 	v6MagicIPPool   *ippool
@@ -95,8 +91,8 @@ func (c *client) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	ipSets := c.getIPSets()
 	c.gen++
+	ipSets := c.getIPSets()
 	c.v4MagicIPPool = newIPPool(ipSets.v4Magic)
 	c.v4TransitIPPool = newIPPool(ipSets.v4Transit)
 	c.v6MagicIPPool = newIPPool(ipSets.v6Magic)
@@ -107,11 +103,6 @@ func (c *client) reset() {
 	// Drop any assignments still waiting to be sent. They describe the state
 	// we just cleared, so delivering them would register transit IPs with
 	// connectors that this client no longer knows anything about.
-	//
-	// This is queue hygiene rather than correctness: it frees capacity so that
-	// reservations made after the reset aren't rejected by a backlog of stale
-	// ones. Correctness comes from the gen bump above, which also covers the
-	// assignment sendLoop has already dequeued and can't be drained here.
 	for {
 		select {
 		case _, ok := <-c.addrsCh:
@@ -247,8 +238,6 @@ const firstGen = 1
 // longer exists, so it's dropped rather than applied.
 var errStaleGeneration = errors.New("address assignment is from a previous generation")
 
-// assignmentIsCurrent reports whether as was created since the last
-// [client.reset], i.e. whether it still describes state this client tracks.
 func (c *client) assignmentIsCurrent(as addrs) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -263,16 +252,16 @@ func (c *client) addTransitIPForConnector(as addrs) error {
 	if conn.Key().IsZero() {
 		return fmt.Errorf("node with stable ID %q does not have a key", conn.StableID())
 	}
-	return c.insertTransitConnMapping(as, conn.Key())
+	if !c.assignmentIsCurrent(as) {
+		return errStaleGeneration
+	}
+	return c.insertTransitConnMapping(as.connectorAddr.transit, conn.Key())
 }
 
 // errQueueFull is returned when the address assignment send queue is full and
 // the assignment was dropped. It's backpressure, not a hard failure.
 var errQueueFull = errors.New("queue full")
 
-// enqueueAddressAssignment queues addrs to be sent to its connector.
-// c.mu must be held: [client.reset] drains the queue under the same lock, and
-// relies on nothing being able to enqueue while it does.
 func (c *client) enqueueAddressAssignment(addrs *addrs) error {
 	select {
 	// TODO(fran) investigate the value of waiting for multiple addresses and sending them
@@ -372,8 +361,7 @@ type addrs struct {
 	magic netip.Addr
 	// gen is the [client.gen] this assignment was created under, stamped by
 	// [client.reserveAddresses]. It travels with every copy of the assignment,
-	// so a copy that has escaped c.mu can still say which generation it belongs
-	// to. See the comment on [client.gen].
+	// so a copy that has escaped c.mu can still say which generation it belongs to.
 	gen             uint64
 	connectorAddr   connectorAddr
 	domain          dnsname.FQDN
@@ -399,18 +387,9 @@ func (as addrs) is6() bool {
 // for the provided transitIP (as a prefix).
 // The provided assignment must already be present in the byTransitIP map, and
 // must be from the current generation.
-func (c *client) insertTransitConnMapping(as addrs, connKey key.NodePublic) error {
+func (c *client) insertTransitConnMapping(tip netip.Addr, connKey key.NodePublic) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Checked under c.mu, which is what makes this exclusive with [client.reset].
-	// A presence check on byTransitIP alone isn't enough: reset rebuilds the
-	// pools from scratch, so the same transit IP can be handed back out to a
-	// new assignment, and the lookup below would then succeed for a connector
-	// belonging to the profile we just left.
-	if as.gen != c.gen {
-		return errStaleGeneration
-	}
-	tip := as.connectorAddr.transit
 	if _, ok := c.assignments.lookupByTransitIP(tip); !ok {
 		return errors.New("transit IP is not already known")
 	}
