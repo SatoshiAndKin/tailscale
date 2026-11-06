@@ -32,7 +32,7 @@ type client struct {
 
 	// Remember to add new fields to [client.reset] if needed.
 	mu              sync.Mutex // protects the fields below
-	gen             uint64     // Current generation ID
+	generation      uint64     // Current generation ID
 	v4MagicIPPool   *ippool
 	v4TransitIPPool *ippool
 	v6MagicIPPool   *ippool
@@ -91,7 +91,7 @@ func (c *client) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.gen++
+	c.generation++
 	ipSets := c.getIPSets()
 	c.v4MagicIPPool = newIPPool(ipSets.v4Magic)
 	c.v4TransitIPPool = newIPPool(ipSets.v4Transit)
@@ -201,9 +201,9 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 		return nil, err
 	}
 	as := &addrs{
-		dst:   dst,
-		magic: mip,
-		gen:   c.gen,
+		dst:        dst,
+		magic:      mip,
+		generation: c.generation,
 		connectorAddr: connectorAddr{
 			transit: tip,
 			node:    connectorNode,
@@ -226,22 +226,25 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 	return as, nil
 }
 
-// firstGen is the generation a newly constructed [client] starts at. It is
-// deliberately above the zero value: an [addrs] that was never stamped by
+// firstGeneration is the generation a newly constructed [client] starts at. It
+// is deliberately above the zero value: an [addrs] that was never stamped by
 // [client.reserveAddresses] then can't match the current generation, so a
 // missing stamp is dropped consistently rather than passing until the first
 // [client.reset].
-const firstGen = 1
+const firstGeneration = 1
 
 // errStaleGeneration is returned when an assignment reserved before a
 // [client.reset] is applied after it. The assignment describes state that no
 // longer exists, so it's dropped rather than applied.
 var errStaleGeneration = errors.New("address assignment is from a previous generation")
 
+// assignmentIsCurrent reports whether as was created since the last
+// [client.reset]. It drops c.mu before returning, so it's advisory only:
+// [client.insertTransitConnMapping] makes the check that counts.
 func (c *client) assignmentIsCurrent(as addrs) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return as.gen == c.gen
+	return as.generation == c.generation
 }
 
 func (c *client) addTransitIPForConnector(as addrs) error {
@@ -252,10 +255,7 @@ func (c *client) addTransitIPForConnector(as addrs) error {
 	if conn.Key().IsZero() {
 		return fmt.Errorf("node with stable ID %q does not have a key", conn.StableID())
 	}
-	if !c.assignmentIsCurrent(as) {
-		return errStaleGeneration
-	}
-	return c.insertTransitConnMapping(as.connectorAddr.transit, conn.Key())
+	return c.insertTransitConnMapping(as, conn.Key())
 }
 
 // errQueueFull is returned when the address assignment send queue is full and
@@ -359,10 +359,11 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 type addrs struct {
 	dst   netip.Addr
 	magic netip.Addr
-	// gen is the [client.gen] this assignment was created under, stamped by
-	// [client.reserveAddresses]. It travels with every copy of the assignment,
-	// so a copy that has escaped c.mu can still say which generation it belongs to.
-	gen             uint64
+	// generation is the [client.generation] this assignment was created under,
+	// stamped by [client.reserveAddresses]. It travels with every copy of the
+	// assignment, so a copy that has escaped c.mu can still say which
+	// generation it belongs to.
+	generation      uint64
 	connectorAddr   connectorAddr
 	domain          dnsname.FQDN
 	app             string
@@ -387,9 +388,17 @@ func (as addrs) is6() bool {
 // for the provided transitIP (as a prefix).
 // The provided assignment must already be present in the byTransitIP map, and
 // must be from the current generation.
-func (c *client) insertTransitConnMapping(tip netip.Addr, connKey key.NodePublic) error {
+func (c *client) insertTransitConnMapping(as addrs, connKey key.NodePublic) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Checked under c.mu so this is exclusive with [client.reset]. A presence
+	// check on byTransitIP alone isn't enough: reset rebuilds the pools, so the
+	// same transit IP can be reissued to a new assignment and the lookup below
+	// would succeed for a connector from the profile we just left.
+	if as.generation != c.generation {
+		return errStaleGeneration
+	}
+	tip := as.connectorAddr.transit
 	if _, ok := c.assignments.lookupByTransitIP(tip); !ok {
 		return errors.New("transit IP is not already known")
 	}

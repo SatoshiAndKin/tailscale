@@ -545,7 +545,7 @@ func newConn25(logf logger.Logf) *Conn25 {
 		addrsCh:     make(chan addrs, 64),
 		assignments: addrAssignments{clock: tstime.StdClock{}},
 		getIPSets:   getIPSets,
-		gen:         firstGen,
+		generation:  firstGeneration,
 	}
 	c.connector = &connector{
 		logf:        logf,
@@ -908,6 +908,10 @@ func (e *extension) sendLoop(ctx context.Context) {
 
 func (e *extension) handleAddressAssignment(ctx context.Context, as addrs) error {
 	if !e.conn25.client.assignmentIsCurrent(as) {
+		// Nothing was sent, so no state is left anywhere. Expected after a
+		// profile change, so it's not an error, but log it: if this appears
+		// without one, assignments are being dropped that shouldn't be.
+		e.conn25.logf("dropping address assignment for %v, invalidated before it was sent", as.domain)
 		return nil
 	}
 	err := e.sendAddressAssignment(ctx, as)
@@ -917,6 +921,10 @@ func (e *extension) handleAddressAssignment(ctx context.Context, as addrs) error
 	err = e.conn25.client.addTransitIPForConnector(as)
 	if err != nil {
 		if errors.Is(err, errStaleGeneration) {
+			// The connector registered the transit IP but we no longer track
+			// it, so it holds a mapping we've forgotten until its own expiry
+			// sweeper reaps it.
+			e.conn25.logf("address assignment for %v invalidated while registering transit IP %v, dropping it", as.domain, as.connectorAddr.transit)
 			return nil
 		}
 		return err

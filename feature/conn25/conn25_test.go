@@ -1521,7 +1521,7 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 				tt.wantByMagicIP,
 				c.client.assignments.byMagicIP,
 				cmp.AllowUnexported(addrs{}, connectorAddr{}),
-				cmpopts.IgnoreFields(addrs{}, "expiresAt", "gen"),
+				cmpopts.IgnoreFields(addrs{}, "expiresAt", "generation"),
 				cmpopts.EquateComparable(netip.Addr{}),
 				nodeViewComparer,
 			); diff != "" {
@@ -2069,13 +2069,12 @@ func TestHandleAddressAssignmentDropsStaleGeneration(t *testing.T) {
 
 	// Build the assignment by hand rather than reserving one, so that it never
 	// goes through addrsCh and sendLoop can't race us for it. That means
-	// stamping the generation ourselves, the way enqueueAddressAssignment
-	// would have.
+	// stamping the generation ourselves, the way reserveAddresses would have.
 	c := ext.conn25.client
 	as := &addrs{
-		dst:   netip.MustParseAddr("1.2.3.4"),
-		magic: netip.MustParseAddr("100.64.0.0"),
-		gen:   c.currentGen(),
+		dst:        netip.MustParseAddr("1.2.3.4"),
+		magic:      netip.MustParseAddr("100.64.0.0"),
+		generation: c.currentGeneration(),
 		connectorAddr: connectorAddr{
 			transit: netip.MustParseAddr("169.254.0.1"),
 			node:    connectorPeer,
@@ -2107,7 +2106,7 @@ func TestHandleAddressAssignmentDropsStaleGeneration(t *testing.T) {
 	}
 
 	// After a reset the same assignment is stale: no request, no mapping, and
-	// no error for sendLoop to log.
+	// no error for sendLoop to surface.
 	expectStale.Store(true)
 	c.reset()
 	if err := ext.handleAddressAssignment(context.Background(), *as); err != nil {

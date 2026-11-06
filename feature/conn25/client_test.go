@@ -405,14 +405,14 @@ func TestResetDropsInFlightAssignment(t *testing.T) {
 	}
 }
 
-// currentGen returns the client's current generation, for tests that build an
-// [addrs] by hand instead of letting [client.reserveAddresses] stamp one.
-// Leaving gen off such a literal would only ever give the zero value, which
-// happens to be current until something calls [client.reset].
-func (c *client) currentGen() uint64 {
+// currentGeneration returns the client's current generation, for tests that
+// build an [addrs] by hand instead of letting [client.reserveAddresses] stamp one.
+// Leaving generation off such a literal would only ever give the zero value,
+// which happens to be current until something calls [client.reset].
+func (c *client) currentGeneration() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.gen
+	return c.generation
 }
 
 // enqueueAddressAssignmentForTest is [client.enqueueAddressAssignment] with the
@@ -425,7 +425,7 @@ func (c *client) currentGen() uint64 {
 func (c *client) enqueueAddressAssignmentForTest(as *addrs) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	as.gen = c.gen
+	as.generation = c.generation
 	return c.enqueueAddressAssignment(as)
 }
 
@@ -435,7 +435,7 @@ func TestTransitIPConnMapping(t *testing.T) {
 	as := &addrs{
 		dst:           netip.MustParseAddr("1.2.3.1"),
 		magic:         netip.MustParseAddr("100.64.0.1"),
-		gen:           conn25.client.currentGen(),
+		generation:    conn25.client.currentGeneration(),
 		connectorAddr: connectorAddr{transit: netip.MustParseAddr("169.254.0.1")},
 		domain:        "woo.example.com.",
 		app:           "app1",
