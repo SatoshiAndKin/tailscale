@@ -991,6 +991,15 @@ func (rp *reverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy is closed", http.StatusServiceUnavailable)
 		return
 	}
+	// Keep response writes from closing the request body while the transport
+	// checks its final EOF. Otherwise it can close an active backend response.
+	if r.ProtoMajor == 1 {
+		if err := http.NewResponseController(w).EnableFullDuplex(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			rp.logf("enabling full-duplex proxy response: %v", err)
+			http.Error(w, "proxy setup failed", http.StatusInternalServerError)
+			return
+		}
+	}
 	p := &httputil.ReverseProxy{BufferPool: &serveProxyBuffers, Rewrite: func(r *httputil.ProxyRequest) {
 		oldOutPath := r.Out.URL.Path
 		r.SetURL(rp.url)
