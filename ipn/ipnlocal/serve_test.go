@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"os"
@@ -26,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1280,6 +1282,109 @@ func TestServeMaxIdleConnsPerHost(t *testing.T) {
 				t.Errorf("MaxIdleConnsPerHost = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestServeMaxIdleConns(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		env  string
+		want int
+	}{
+		{name: "default", want: 100},
+		{name: "configured", env: "1024", want: 1024},
+		{name: "unlimited", env: "0", want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			envknob.SetenvForTest(t, "TS_DEBUG_SERVE_MAX_IDLE_CONNS", tt.env)
+			rp := &reverseProxy{lb: &LocalBackend{dialer: tsdial.NewDialer(netmon.NewStatic())}}
+			if got := rp.getTransport().MaxIdleConns; got != tt.want {
+				t.Errorf("MaxIdleConns = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestServeProxyReusesConcurrentBackendConnections(t *testing.T) {
+	const clients = 300
+	envknob.SetenvForTest(t, "TS_DEBUG_SERVE_MAX_IDLE_CONNS", "1024")
+	envknob.SetenvForTest(t, "TS_DEBUG_SERVE_MAX_IDLE_CONNS_PER_HOST", "1024")
+	var opened atomic.Int32
+	var arrived [2]atomic.Int32
+	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		round, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/"))
+		if err != nil || round < 0 || round >= len(release) {
+			http.Error(w, "invalid round", http.StatusBadRequest)
+			return
+		}
+		if arrived[round].Add(1) == clients {
+			close(release[round])
+		}
+		select {
+		case <-release[round]:
+			io.WriteString(w, "ok")
+		case <-r.Context().Done():
+		}
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			opened.Add(1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	defer dialer.Close()
+	rp := &reverseProxy{lb: &LocalBackend{dialer: dialer}}
+	transport := rp.getTransport()
+	defer transport.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for round := range 2 {
+		var finished sync.WaitGroup
+		var returned atomic.Int32
+		errs := make(chan error, clients)
+		for range clients {
+			finished.Go(func() {
+				trace := &httptrace.ClientTrace{PutIdleConn: func(err error) {
+					if err == nil {
+						returned.Add(1)
+					}
+				}}
+				req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), "GET", fmt.Sprintf("%s/%d", server.URL, round), nil)
+				if err != nil {
+					errs <- err
+					return
+				}
+				response, err := transport.RoundTrip(req)
+				if err != nil {
+					errs <- err
+					return
+				}
+				body, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				if err != nil {
+					errs <- err
+				} else if response.StatusCode != http.StatusOK || string(body) != "ok" {
+					errs <- fmt.Errorf("unexpected response: %s %q", response.Status, body)
+				}
+			})
+		}
+		finished.Wait()
+		close(errs)
+		for err := range errs {
+			t.Error(err)
+		}
+		if t.Failed() {
+			return
+		}
+		if got := returned.Load(); got != clients {
+			t.Fatalf("round %d returned %d idle connections, want %d", round, got, clients)
+		}
+		if got := opened.Load(); got != clients {
+			t.Fatalf("round %d opened %d backend connections, want %d reused connections", round, got, clients)
+		}
 	}
 }
 

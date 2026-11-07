@@ -1079,6 +1079,10 @@ func (b *LocalBackend) refuseIfConnectedToTailscaledSocket(conn net.Conn) error 
 // to the backend. The Transport gets created lazily, at most once.
 func (rp *reverseProxy) getTransport() *http.Transport {
 	return rp.httpTransport.Get(func() *http.Transport {
+		maxIdleConns := 100
+		if n, ok := envknob.LookupInt("TS_DEBUG_SERVE_MAX_IDLE_CONNS"); ok {
+			maxIdleConns = n
+		}
 		// Zero preserves http.Transport's default MaxIdleConnsPerHost value.
 		maxIdleConnsPerHost, _ := envknob.LookupInt("TS_DEBUG_SERVE_MAX_IDLE_CONNS_PER_HOST")
 		dial := rp.lb.dialer.SystemDial
@@ -1095,7 +1099,7 @@ func (rp *reverseProxy) getTransport() *http.Transport {
 			},
 			// Values for the following parameters have been copied from http.DefaultTransport.
 			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
+			MaxIdleConns:          maxIdleConns,
 			MaxIdleConnsPerHost:   maxIdleConnsPerHost,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
